@@ -78,6 +78,56 @@ function lerp(c1, c2, t) {
   return [0, 1, 2].map(i => Math.round(c1[i] * (1 - t) + c2[i] * t));
 }
 
+// Deterministic 2D hash in [0,1): the same on every run and machine, so
+// the print grain below never breaks the two-runs-identical rule.
+function hash(x, y) {
+  let h = Math.imul(x | 0, 374761393) ^ Math.imul(y | 0, 668265263);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+}
+
+// Print grain: jitter every pixel's brightness by a hash of its position
+// (optionally in blocks, which compress better and read as halftone).
+function grain(x0, y0, x1, y1, amt, block = 1) {
+  for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+    const i = (y * W + x) * 3;
+    const n = (hash(Math.floor(x / block), Math.floor(y / block)) - 0.5) * 2 * amt;
+    img[i] = Math.max(0, Math.min(255, img[i] + n));
+    img[i + 1] = Math.max(0, Math.min(255, img[i + 1] + n));
+    img[i + 2] = Math.max(0, Math.min(255, img[i + 2] + n * 0.92));
+  }
+}
+
+function ellipse(cx, cy, rx, ry, c, a = 1) {
+  const k = Math.max(4, Math.min(30, Math.min(rx, ry) * 1.2));
+  for (let y = Math.floor(cy - ry - 2); y <= cy + ry + 2; y++)
+    for (let x = Math.floor(cx - rx - 2); x <= cx + rx + 2; x++) {
+      const d = Math.hypot((x - cx) / rx, (y - cy) / ry);
+      const cov = Math.min(1, Math.max(0, (1 - d) * k));
+      if (cov > 0) px(x, y, c, a * cov);
+    }
+}
+
+// Spherical shading over a disc already painted in img: diffuse light
+// from the upper left plus a soft specular glint, so a flat circle
+// reads as a lit ball. Writes img directly; the disc must be painted.
+function shadeDisc(cx, cy, r, darkAmt, specAmt) {
+  const LX = -0.52, LY = -0.58, LZ = 0.63;
+  for (let y = Math.floor(cy - r); y <= cy + r; y++)
+    for (let x = Math.floor(cx - r); x <= cx + r; x++) {
+      const nx = (x - cx) / r, ny = (y - cy) / r, d2 = nx * nx + ny * ny;
+      if (d2 > 1 || x < 0 || y < 0 || x >= W || y >= H) continue;
+      const nz = Math.sqrt(1 - d2);
+      const diff = Math.max(0, nx * LX + ny * LY + nz * LZ);
+      const f = (1 - darkAmt) + (darkAmt + 0.10) * diff;
+      const spec = specAmt * Math.pow(diff, 18) * 255;
+      const i = (y * W + x) * 3;
+      img[i] = Math.min(255, img[i] * f + spec);
+      img[i + 1] = Math.min(255, img[i + 1] * f + spec);
+      img[i + 2] = Math.min(255, img[i + 2] * f + spec * 0.95);
+    }
+}
+
 // ---- 5x7 bitmap font (rows top to bottom, 5 bits per row, LSB = left) ----
 // Bit order verified against the 22 November edition: glyphs render upright,
 // S and the apostrophe use the corrected (bit-reversed) rows.
@@ -156,6 +206,18 @@ function drawBlock(x, y, text, scale, c, maxChars, lineH, opts = {}) {
 
 // ---- background ----
 rect(0, 0, W, H, PAPER);
+// newsprint stock: a faint vignette, coarse block grain and sparse fibre
+// flecks, so the sheet reads as printed paper rather than a flat fill
+for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+  const dx = (x - W / 2) / (W / 2), dy = (y - H / 2) / (H / 2);
+  const vig = 1 - 0.055 * Math.min(1, (dx * dx + dy * dy) / 2);
+  const i = (y * W + x) * 3;
+  const n = (hash(x >> 2, y >> 2) - 0.5) * 5;
+  img[i] = img[i] * vig + n; img[i + 1] = img[i + 1] * vig + n; img[i + 2] = img[i + 2] * vig + n * 0.9;
+  const f = hash(x * 3 + 11, y * 5 + 7);
+  if (f > 0.99965) { img[i] -= 26; img[i + 1] -= 24; img[i + 2] -= 20; }       // dark fibre fleck
+  else if (f < 0.0003) { img[i] += 15; img[i + 1] += 14; img[i + 2] += 11; }   // light fleck
+}
 const M = 44;                 // page margin
 const IW = W - 2 * M;         // inner width = 936
 
@@ -177,54 +239,95 @@ drawText(M, 260, 'IN ANTALYA', 7, INK, { bold: true });
 // running hot, and the empty chairs of a summit hall that found no deal
 const IX = M, IY = 330, IWd = IW, IH = 196;
 clip = { x0: IX, y0: IY, x1: IX + IWd, y1: IY + IH };
-for (let yy = 0; yy < IH; yy++) rect(IX, IY + yy, IWd, 1, lerp(SKY_TOP, SKY_LOW, Math.min(1, yy / (IH * 0.8))));
+// dusk sky, printed: the gradient is stepped and ordered-dithered so it
+// carries a halftone grain instead of a flat digital ramp, and a warm
+// glow sits low over the horizon where the talks burned out
+const BAYER4 = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+const GLOW = [216, 138, 74];
+for (let yy = 0; yy < IH; yy++) for (let xx = 0; xx < IWd; xx++) {
+  const t = Math.min(1, yy / (IH * 0.8));
+  const steps = 26, v = t * (steps - 1), base = Math.floor(v);
+  const idx = base + ((v - base) > (BAYER4[yy & 3][xx & 3] + 0.5) / 16 ? 1 : 0);
+  let c = lerp(SKY_TOP, SKY_LOW, idx / (steps - 1));
+  const gd = Math.hypot(xx - 660, (yy - 168) * 1.7);           // horizon glow
+  const ga = Math.max(0, 1 - gd / 430) * 0.5;
+  if (ga > 0) c = lerp(c, GLOW, ga);
+  px(IX + xx, IY + yy, c);
+}
+// soft cloud banks: stacked translucent ellipses with feathered edges
+for (const [cx, cy, rx, ry, a] of [[150, 52, 120, 9, 0.10], [430, 34, 150, 8, 0.08], [760, 58, 130, 10, 0.12], [250, 84, 170, 8, 0.07], [620, 92, 150, 7, 0.09]]) {
+  for (let k = 4; k >= 1; k--) ellipse(IX + cx, IY + cy, rx * k / 4, ry * k / 4, [226, 222, 214], a);
+}
 // faint stars in the upper sky
 for (const [sx, sy] of [[90, 22], [180, 44], [330, 16], [520, 30], [700, 18], [860, 40], [60, 70], [780, 66]]) {
   rect(IX + sx, IY + sy, 3, 3, PAPER, 0.8); rect(IX + sx + 1, IY + sy - 2, 1, 7, PAPER, 0.5);
 }
 const gx = IX + 250, gy = IY + 96, gr = 76;   // cracked globe
-circle(gx, gy, gr + 3, INK);                  // outline ring
+circle(gx, gy, gr + 6, [150, 186, 224], 0.45);   // atmosphere halo
+circle(gx, gy, gr + 3, INK);                    // outline ring
 clip = { x0: gx - gr, y0: gy - gr, x1: gx + gr, y1: gy + gr };
 circle(gx, gy, gr, GLOBE_BLUE);
-for (const [lx, ly, lr] of [[-38, -28, 22], [-6, -40, 16], [30, -18, 20], [-30, 22, 24], [22, 30, 18], [44, 8, 12]]) {
-  circle(gx + lx, gy + ly, lr, GLOBE_GREEN);  // continents
+// ocean depth: deeper water toward the lower right, lit from upper left
+for (let y = gy - gr; y <= gy + gr; y++) for (let x = gx - gr; x <= gx + gr; x++) {
+  const nx = (x - gx) / gr, ny = (y - gy) / gr;
+  if (nx * nx + ny * ny > 1) continue;
+  const i = (y * W + x) * 3;
+  const f = 1 - 0.16 * Math.max(0, nx * 0.6 + ny * 0.8) + 0.10 * Math.max(0, -(nx * 0.6 + ny * 0.8));
+  img[i] *= f; img[i + 1] *= f; img[i + 2] *= f;
 }
-circle(gx - 30, gy - 52, 26, PAPER, 0.85);    // polar cap
-// the crack: a jagged fault running down the globe
+// continents in two tones: the land, its shadow side, a lit highland
+for (const [lx, ly, lr] of [[-38, -28, 22], [-6, -40, 16], [30, -18, 20], [-30, 22, 24], [22, 30, 18], [44, 8, 12], [-52, 4, 13], [8, -2, 11]]) {
+  circle(gx + lx + 3, gy + ly + 4, lr, [70, 112, 62]);
+  circle(gx + lx, gy + ly, lr, GLOBE_GREEN);
+  circle(gx + lx - lr * 0.3, gy + ly - lr * 0.3, lr * 0.45, [118, 158, 100]);
+}
+circle(gx + 34, gy - 34, 10, [172, 154, 98]);   // an arid belt
+circle(gx - 30, gy - 52, 26, [236, 239, 240], 0.95);   // polar cap
+shadeDisc(gx, gy, gr, 0.34, 0.45);              // sphere light + glint
+// the crack: a pale split edge first, then the dark fault over it
 const crack = [[-52, -58], [-30, -34], [-44, -12], [-14, 6], [-30, 26], [-2, 44], [-16, 62], [8, 76]];
+for (let i = 0; i + 1 < crack.length; i++) line(gx + crack[i][0] + 3, gy + crack[i][1], gx + crack[i + 1][0] + 3, gy + crack[i + 1][1], 5, [212, 222, 230], 0.5);
 for (let i = 0; i + 1 < crack.length; i++) line(gx + crack[i][0], gy + crack[i][1], gx + crack[i + 1][0], gy + crack[i + 1][1], 5, INK);
 for (const [ox, oy] of [[-46, -44], [-24, -2], [-10, 34]]) {  // crack splinters
   line(gx + ox, gy + oy, gx + ox + 18, gy + oy - 12, 3, INK);
   line(gx + ox, gy + oy, gx + ox + 16, gy + oy + 10, 3, INK);
 }
 clip = { x0: IX, y0: IY, x1: IX + IWd, y1: IY + IH };
-// thermometer, mercury near the top
+// thermometer: a soft shadow, a glass tube with a lit edge, and mercury
+// graded from a hot bright head down to deep red at the bulb
 const tx = IX + 560, ty = IY + 22, tw = 26, th = 118;
-rect(tx, ty, tw, th, PAPER);
-rect(tx, ty, tw, th, INK, 0);                 // (kept for spacing)
-for (let yy = 0; yy < th; yy++) rect(tx + 4, ty + yy, tw - 8, 1, MERCURY, yy > th * 0.22 ? 1 : 0);
-circle(tx + tw / 2, ty + th + 14, 24, PAPER);
-circle(tx + tw / 2, ty + th + 14, 24, INK, 0);
-circle(tx + tw / 2, ty + th + 14, 19, MERCURY);
+rect(tx + 4, ty + 4, tw, th, INK, 0.16);                       // shadow
+circle(tx + tw / 2 + 4, ty + th + 17, 24, INK, 0.16);          // bulb shadow
+rect(tx, ty, tw, th, [243, 241, 237]);                         // glass tube
+for (let yy = 0; yy < th; yy++) rect(tx + 5, ty + yy, tw - 10, 1, lerp([240, 98, 44], [168, 30, 14], yy / th), yy > th * 0.22 ? 1 : 0);
+rect(tx + 3, ty + 2, 4, th - 4, [255, 255, 255], 0.55);        // glass highlight
+rect(tx + tw - 6, ty + 2, 3, th - 4, INK, 0.10);               // glass shade
+circle(tx + tw / 2, ty + th + 14, 24, [243, 241, 237]);        // bulb glass
+circle(tx + tw / 2, ty + th + 14, 19, [198, 42, 20]);          // bulb mercury
+shadeDisc(tx + tw / 2, ty + th + 14, 19, 0.30, 0.5);           // bulb light + glint
 rect(tx, ty, 2, th, INK); rect(tx + tw - 2, ty, 2, th, INK); rect(tx, ty, tw, 2, INK);
-circle(tx + tw / 2, ty + th + 14, 24, INK, 0.0);
 for (let k = 0; k < 5; k++) line(tx + tw + 2, ty + 10 + k * 26, tx + tw + 12, ty + 10 + k * 26, 2, INK);
 drawText(tx + tw + 18, ty + 4, '40C', 3, INK, { bold: true });
-// empty summit hall: a long table and vacant chairs along the bottom
+// empty summit hall: a graded floor, a long table and vacant chairs
 const base = IY + IH * 0.86;
-rect(IX, base, IWd, IY + IH - base, INK);
-rect(IX + 40, base - 14, IWd - 80, 6, PAPER);          // the long table
+for (let yy = 0; yy < IY + IH - base; yy++) rect(IX, base + yy, IWd, 1, lerp([54, 49, 42], [18, 16, 14], yy / (IY + IH - base)));
+rect(IX + 40, base - 14, IWd - 80, 6, [233, 227, 215]);          // the long table, lit top
+rect(IX + 40, base - 8, IWd - 80, 2, [122, 114, 102]);           // table front edge
 for (let f = 0; f < 7; f++) {                           // empty chairs
   const cx0 = IX + 80 + f * 118;
-  rect(cx0, base - 34, 34, 4, PAPER);                   // seat back
-  rect(cx0 + 4, base - 30, 4, 16, PAPER);               // legs
-  rect(cx0 + 26, base - 30, 4, 16, PAPER);
-  rect(cx0, base - 14, 34, 4, PAPER);                   // seat
+  ellipse(cx0 + 17, base - 1, 24, 4, [0, 0, 0], 0.35);           // chair shadow
+  rect(cx0, base - 34, 34, 4, [230, 224, 212]);                   // seat back
+  rect(cx0 + 4, base - 30, 4, 16, [152, 145, 132]);               // legs
+  rect(cx0 + 26, base - 30, 4, 16, [152, 145, 132]);
+  rect(cx0, base - 14, 34, 4, [208, 200, 186]);                   // seat
+  line(cx0 + 15, base - 14, cx0 + 18, base - 23, 2, [214, 208, 196], 0.9);   // gooseneck mic
+  circle(cx0 + 18, base - 24, 2, [214, 208, 196], 0.9);
   rect(cx0 + 8, base - 10, 18, 3, ACCENT);              // name plate, no name
 }
 clip = { x0: 0, y0: 0, x1: W, y1: H };
 rect(IX, IY, IWd, 2, INK); rect(IX, IY + IH - 2, IWd, 2, INK);
 rect(IX, IY, 2, IH, INK); rect(IX + IWd - 2, IY, 2, IH, INK);
+grain(IX, IY, IX + IWd, IY + IH, 6, 2);   // print grain over the picture
 
 // lead summary
 drawBlock(M, 542,
@@ -284,7 +387,11 @@ box(M + 634, row2Y, bw2, row2H, 'ASIA — INDONESIA', 'FACTORY FIRE: 7 DEAD, 50 
 
 // ---- footer ----
 rect(M, 990, IW, 1, INK);
-drawText(0, 998, 'DRAWN BY AN AI AGENT FROM THE DAY’S WIRES', 2, BODY, { align: 'center' });
+drawText(0, 998, 'DRAWN BY AN AI AGENT FROM THE DAILY WIRES', 2, BODY, { align: 'center' });
+
+// one last whisper of grain over the whole sheet, text included, the
+// way ink sits unevenly on real newsprint (kept faint: legibility first)
+grain(0, 0, W, H, 2, 2);
 
 // ---- PNG encoder ----
 const CRC_TABLE = (() => {
